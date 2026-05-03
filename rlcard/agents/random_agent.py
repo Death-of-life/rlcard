@@ -42,6 +42,11 @@ class RandomAgent(object):
             probs[i] = 1/len(state['legal_actions'])
 
         info = {}
-        info['probs'] = {state['raw_legal_actions'][i]: probs[list(state['legal_actions'].keys())[i]] for i in range(len(state['legal_actions']))}
+        raw_legal = state.get('raw_legal_actions', [])
+        legal_keys = list(state['legal_actions'].keys())
+        info['probs'] = {}
+        for i in range(len(legal_keys)):
+            key = raw_legal[i] if isinstance(raw_legal[i], str) else raw_legal[i].get('id', str(legal_keys[i]))
+            info['probs'][key] = probs[legal_keys[i]]
 
         return self.step(state), info
