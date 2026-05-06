@@ -18,7 +18,7 @@ Python (rlcard-ptcg)
   examples/                自对弈、评估脚本
 ```
 
-## 当前进度（2026-05-03）
+## 当前进度（2026-05-04）
 
 当前仓库已经进入“PTCG RL 框架可冒烟运行”的阶段，但还没有到可以长期训练强模型的阶段。
 
@@ -36,11 +36,17 @@ Python (rlcard-ptcg)
 - `rlcard.make("ptcg", ...)` 可以 reset，当前运行时 `obs` 维度观察值为 68。
 - `legal_actions` 是 template id 的 `OrderedDict`，`raw_legal_actions` 是 Rust 输出的具体合法动作视图。
 - 当前 `raw_legal_actions` 数量可能大于 template 数量，因为多个具体动作会映射到同一个 template。
+- 已新增通用启发式 raw action tie-breaker：DQN/NFSP 仍学习 `template_id`，但训练和评估可通过 `--raw-action-tie-breaker heuristic` 在同 template 的 raw actions 中选择具体 `action_id`。
+- 当前 tie-breaker 只使用可见状态、target、hand_index、HP、能量、stage 等通用字段，不写卡牌专属规则，也不是 learned raw action scorer。
+- 已新增 PPO V1：`PtcgPPOAgent` 学习 15 个 template action，使用 masked policy/value 网络和 GAE，具体 raw action 仍由 heuristic tie-breaker 选择。
+- 已新增 `examples/run_ptcg_ppo.py`，使用手写 rollout loop 保存 PPO 所需的 `log_prob`、`value`、`legal_mask`，支持固定双牌组和 `configs/ptcg_deck_pool.json`。
+- 已新增统一实验入口：`examples/ptcg_experiment.py`，用 `train/eval/matrix/launch/status` 五个 subcommand 管理训练、评估、矩阵长跑和后台状态；后续推荐优先使用这个入口。
+- 已新增后台矩阵评估启动脚本：`examples/run_ptcg_matrix_background.sh`，支持 DQN/NFSP/PPO checkpoint，默认跑北京沙、龙神柱、猛雷鼓三套牌的 3x3 有序矩阵，并记录 `command.txt`、`run.sh`、`pid`、`stdout.log`、`status.txt`、`exit_code`、`results.csv`、`results.json`。
 
 当前阻塞和不一致：
 
 - 系统 `python3` 环境缺少 `deckgym_ptcg`，需要使用 deckgym-core 的 `.venv`，或先执行 `maturin develop`。
-- deckgym-core `.venv` 当前缺少 `torch`，DQN/NFSP 训练还不能直接启动。
+- DQN/NFSP/PPO 训练需要 deckgym-core `.venv` 中安装 `torch`、`matplotlib`；当前本机已用该 venv 跑通过 smoke 训练。
 - deckgym-core 普通 `cargo test` 当前会因为 PyO3 `extension-module` 链接 Python 符号失败；需要把 Python extension build 和 Rust 原生测试 build 拆开。
 - `README.md`、多数上游 RLCard docs、`rlcard/models` 仍有旧 RLCard 残留，需要后续清理。
 - 当前训练脚本传入 `state_shape=None`，但现有 DQN/NFSP 网络不会自动推断维度；后续必须从 `env.reset()` 推断 `state_shape=[len(state["obs"])]`。
@@ -60,7 +66,7 @@ Python (rlcard-ptcg)
 
 - 修改训练脚本，让 DQN/NFSP 在创建 agent 前 reset env，并显式设置 `state_shape=[obs_dim]`。
 - 明确 raw action agent 与 template action agent 的兼容边界，保证 `PtcgSimpleBotAgent(use_raw=True)` 和神经网络 agent 能在同一个 env.run 流程里稳定工作。
-- 补 checkpoint 加载、保存和继续训练路径，评估脚本支持 DQN/NFSP checkpoint 类型。
+- 补 checkpoint 加载、保存和继续训练路径，评估脚本支持 DQN/NFSP/PPO checkpoint 类型。
 - 固定 seed、牌组、opponent，输出最小评估矩阵。
 
 ### Phase 2：强基线实验
@@ -68,11 +74,67 @@ Python (rlcard-ptcg)
 - 先跑 random、simplebot、heuristic、self checkpoint 的 pairwise 胜率矩阵。
 - 记录 win rate、tie rate、average ply、illegal/fallback action count、action template distribution。
 - 对北京沙、龙神柱、猛雷鼓三套牌分别保存 baseline 曲线和 replay/trace 样本。
-- 用小规模 DQN/NFSP 自对弈确认损失下降、checkpoint 可加载、评估结果可复现。
+- 用小规模 DQN/NFSP/PPO 自对弈确认损失下降、checkpoint 可加载、评估结果可复现。
+
+推荐统一入口命令：
+
+```bash
+cd /Users/easygod/code/rlcard
+
+# PPO warmup：先打 simplebot 学基本节奏
+/Users/easygod/code/deckgym-core/.venv/bin/python examples/ptcg_experiment.py train \
+  --algorithm ppo \
+  --stage warmup \
+  --opponent simplebot \
+  --deck-pool configs/ptcg_deck_pool.json \
+  --rollout-episodes 64 \
+  --updates 200 \
+  --eval-every 10 \
+  --save-every 25 \
+  --log-dir experiments/ptcg-ppo-warmup-run1
+
+# PPO self-play：从 warmup checkpoint 继续训练
+/Users/easygod/code/deckgym-core/.venv/bin/python examples/ptcg_experiment.py train \
+  --algorithm ppo \
+  --stage selfplay \
+  --resume-from experiments/ptcg-ppo-warmup-run1/final/checkpoint_ppo.pt \
+  --deck-pool configs/ptcg_deck_pool.json \
+  --rollout-episodes 64 \
+  --updates 1000 \
+  --eval-every 20 \
+  --save-every 50 \
+  --log-dir experiments/ptcg-ppo-selfplay-run1
+
+# PPO 三套牌矩阵评估
+/Users/easygod/code/deckgym-core/.venv/bin/python examples/ptcg_experiment.py matrix \
+  --agent ppo \
+  --checkpoint experiments/ptcg-ppo-selfplay-run1/final \
+  --opponent simplebot \
+  --deck-pool configs/ptcg_deck_pool.json \
+  --split train \
+  --num-games 1000 \
+  --log-dir experiments/ptcg-matrix-ppo-vs-simplebot-train
+```
+
+后台运行任意统一入口命令：
+
+```bash
+/Users/easygod/code/deckgym-core/.venv/bin/python examples/ptcg_experiment.py launch \
+  --run-dir experiments/ptcg-bg-ppo-selfplay-run1 -- \
+  train --algorithm ppo --stage selfplay \
+  --deck-pool configs/ptcg_deck_pool.json \
+  --rollout-episodes 64 --updates 1000 \
+  --log-dir experiments/ptcg-ppo-selfplay-run1
+
+/Users/easygod/code/deckgym-core/.venv/bin/python examples/ptcg_experiment.py status \
+  --run-dir experiments/ptcg-bg-ppo-selfplay-run1
+```
+
+旧脚本 `run_ptcg_ppo.py`、`run_ptcg_selfplay.py`、`evaluate_ptcg.py`、`evaluate_ptcg_matrix.py`、`run_ptcg_matrix_background.sh` 保留作为兼容入口，但后续文档和实验优先使用 `ptcg_experiment.py`。
 
 ### Phase 3：强模型升级
 
-- 引入 action 参数化或 learned tie-break scorer，减少粗 template 动作造成的信息损失。
+- PPO V1 先保持 template-head baseline；在启发式 raw action tie-breaker 基线稳定后，引入 action 参数化或 learned tie-break scorer，减少粗 template 动作造成的信息损失。
 - 从 card bucket 特征升级到 card id embedding 或 logic_key embedding。
 - 增加并行 rollout，优先保证本机 Mac 可小规模运行，同时预留远端单卡 GPU 配置。
 - 引入 PPO 或 actor-critic self-play，并维护 league/checkpoint pool，降低策略退化风险。
@@ -296,22 +358,57 @@ cd /Users/easygod/code/rlcard
 /Users/easygod/code/deckgym-core/.venv/bin/python examples/evaluate_ptcg.py \
     --deck-a "/Users/easygod/Downloads/Battle Subway 北京沙.txt" \
     --deck-b "/Users/easygod/Downloads/龙神柱 Battle Subway.txt" \
-    --num-games 100 --opponent random
+    --num-games 100 --opponent random \
+    --raw-action-tie-breaker heuristic
 
-# 5. 训练（需要 PyTorch）
+# 4b. 三套牌矩阵评估（推荐统一入口）
+/Users/easygod/code/deckgym-core/.venv/bin/python examples/ptcg_experiment.py matrix \
+    --agent ppo \
+    --checkpoint experiments/ptcg-ppo-selfplay-run1/final \
+    --opponent random \
+    --deck-pool configs/ptcg_deck_pool.json \
+    --split train \
+    --num-games 1000 \
+    --raw-action-tie-breaker heuristic \
+    --log-dir experiments/ptcg-eval-ppo-vs-random-heuristic
+
+# 5. DQN/NFSP legacy 训练（需要 PyTorch）
 /Users/easygod/code/deckgym-core/.venv/bin/pip install torch matplotlib
-/Users/easygod/code/deckgym-core/.venv/bin/python examples/run_ptcg_selfplay.py \
+/Users/easygod/code/deckgym-core/.venv/bin/python examples/ptcg_experiment.py train \
     --algorithm dqn \
     --deck-a "/path/to/deck_a.txt" \
     --deck-b "/path/to/deck_b.txt" \
     --episodes 1000 --eval-every 100 \
+    --raw-action-tie-breaker heuristic \
     --log-dir experiments/ptcg-dqn-run1
+
+# 6. PPO smoke 训练
+/Users/easygod/code/deckgym-core/.venv/bin/python examples/ptcg_experiment.py train \
+    --algorithm ppo \
+    --deck-a "/Users/easygod/Downloads/Battle Subway 北京沙.txt" \
+    --deck-b "/Users/easygod/Downloads/龙神柱 Battle Subway.txt" \
+    --stage selfplay \
+    --rollout-episodes 8 \
+    --updates 2 \
+    --log-dir experiments/ptcg-ppo-smoke
+
+# 7. PPO deck-pool 训练
+/Users/easygod/code/deckgym-core/.venv/bin/python examples/ptcg_experiment.py train \
+    --algorithm ppo \
+    --deck-pool configs/ptcg_deck_pool.json \
+    --train-split train \
+    --stage selfplay \
+    --rollout-episodes 128 \
+    --updates 500 \
+    --eval-every 25 \
+    --save-every 50 \
+    --log-dir experiments/ptcg-ppo-pool-run1
 ```
 
 当前注意事项：
 
 - 若使用系统 `python3`，可能会因为未安装 `deckgym_ptcg` 而无法 import `rlcard`。
-- 在训练脚本修复前，DQN/NFSP 不能依赖 `state_shape=None` 自动推断观测维度。
+- 训练脚本会从 env 推断 `state_shape`；不要重新改回 `state_shape=None`。
 - 普通 Rust 测试需要先修复 PyO3 `extension-module` 链接配置；在此之前优先用 Python env 测试验证绑定行为。
 
 ## 测试覆盖
@@ -331,12 +428,15 @@ cd /Users/easygod/code/rlcard
 | test_payoffs | Python | 对局结束 payoff 正确 (+1/-1/0) |
 | test_action_id_roundtrip | Python | 每个合法 action_id 可执行 |
 | test_trace_recording | Python | trace 记录每步动作 |
+| test_ptcg_raw_tiebreaker | Python | raw action tie-breaker 候选过滤、fallback、slot scoring、DQN/NFSP raw 输出 |
+| test_ptcg_ppo_agent | Python | PPO masked policy、raw 输出、checkpoint、GAE、deck pool |
+| test_ptcg_experiment_cli | Python | 统一实验入口 subcommand 参数解析 |
 
 ## 后续升级方向
 
 1. **特征工程细化**: 加入 card embedding、logic_key one-hot（目标牌组专用）
 2. **动作模型升级**: 从 deterministic tie-break 升级为 action-parameter head 或 pointer network
-3. **算法升级**: 从 DQN/NFSP 升级到 PPO/actor-critic 自对弈
+3. **算法升级**: PPO V1 已可冒烟运行；下一步是并行 rollout、league self-play 和 learned raw action scorer
 4. **并行 rollout**: 使用 Rust rayon 并行评估，提升采样效率
 5. **League/self-play pool**: 避免策略退化
 6. **Replay 可视化**: 基于 deckgym replay JSON 的 UI 面板
@@ -344,4 +444,4 @@ cd /Users/easygod/code/rlcard
 
 ---
 
-*最后更新: 2026-05-03*
+*最后更新: 2026-05-04*

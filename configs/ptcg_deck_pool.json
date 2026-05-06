@@ -1,0 +1,22 @@
+{
+  "decks": [
+    {
+      "name": "beijingsha",
+      "archetype": "beijingsha",
+      "split": "train",
+      "path": "/Users/easygod/Downloads/Battle Subway 北京沙.txt"
+    },
+    {
+      "name": "longshenzhu",
+      "archetype": "longshenzhu",
+      "split": "train",
+      "path": "/Users/easygod/Downloads/龙神柱 Battle Subway.txt"
+    },
+    {
+      "name": "mengleigu",
+      "archetype": "mengleigu",
+      "split": "train",
+      "path": "/Users/easygod/Downloads/猛雷鼓 (1).txt"
+    }
+  ]
+}

@@ -94,6 +94,7 @@ class NFSPAgent(object):
             device (torch.device): Whether to use the cpu or gpu
         '''
         self.use_raw = False
+        self.raw_action_tie_breaker = None
         self._num_actions = num_actions
         self._state_shape = state_shape
         self._layer_sizes = hidden_layers_sizes + [num_actions]
@@ -133,6 +134,13 @@ class NFSPAgent(object):
         # Checkpoint saving parameters
         self.save_path = save_path
         self.save_every = save_every
+
+    def set_raw_action_tie_breaker(self, tie_breaker):
+        ''' Set a PTCG raw action tie-breaker for final action selection. '''
+        self.raw_action_tie_breaker = tie_breaker
+        self.use_raw = tie_breaker is not None
+        if hasattr(self._rl_agent, "set_raw_action_tie_breaker"):
+            self._rl_agent.set_raw_action_tie_breaker(None)
 
     def _build_model(self):
         ''' Build the average policy network
@@ -186,7 +194,7 @@ class NFSPAgent(object):
             probs = remove_illegal(probs, legal_actions)
             action = np.random.choice(len(probs), p=probs)
 
-        return action
+        return self._select_action_output(action, state)
 
     def eval_step(self, state):
         ''' Use the average policy for evaluation purpose
@@ -207,10 +215,20 @@ class NFSPAgent(object):
             probs = remove_illegal(probs, legal_actions)
             action = np.random.choice(len(probs), p=probs)
             info = {}
-            info['probs'] = {state['raw_legal_actions'][i]: float(probs[list(state['legal_actions'].keys())[i]]) for i in range(len(state['legal_actions']))}
+            legal_keys = list(state['legal_actions'].keys())
+            info['probs'] = {}
+            for i in range(len(legal_keys)):
+                raw_item = state['raw_legal_actions'][i]
+                key = raw_item if isinstance(raw_item, (str, int)) else raw_item.get('id', str(legal_keys[i]))
+                info['probs'][key] = float(probs[legal_keys[i]])
         else:
             raise ValueError("'evaluate_with' should be either 'average_policy' or 'best_response'.")
-        return action, info
+        return self._select_action_output(action, state), info
+
+    def _select_action_output(self, template_id, state):
+        if self.raw_action_tie_breaker is None:
+            return template_id
+        return self.raw_action_tie_breaker.choose(int(template_id), state)
 
     def sample_episode_policy(self):
         ''' Sample average/best_response policy
@@ -361,7 +379,7 @@ class NFSPAgent(object):
         agent.policy_network.eval()
         agent.policy_network_optimizer = torch.optim.Adam(agent.policy_network.parameters(), lr=agent._sl_learning_rate)
         agent.policy_network_optimizer.load_state_dict(checkpoint['policy_network_optimizer'])
-        agent._rl_agent.from_checkpoint(checkpoint['rl_agent'])
+        agent._rl_agent = DQNAgent.from_checkpoint(checkpoint['rl_agent'])
         agent._rl_agent.set_device(agent.device)
         return agent
         
@@ -372,6 +390,16 @@ class NFSPAgent(object):
             path (str): the path to save the model
         '''
         torch.save(self.checkpoint_attributes(), os.path.join(path, filename))
+
+    def load_checkpoint(self, path):
+        ''' Load the model checkpoint from a file
+
+        Args:
+            path (str): path to the checkpoint .pt file
+        '''
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        restored = self.__class__.from_checkpoint(checkpoint)
+        self.__dict__.update(restored.__dict__)
         
 
 class AveragePolicyNetwork(nn.Module):
@@ -523,4 +551,3 @@ class ReservoirBuffer(object):
 
     def __iter__(self):
         return iter(self._data)
-

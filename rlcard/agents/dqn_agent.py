@@ -119,10 +119,20 @@ class DQNAgent(object):
 
         # Create replay memory
         self.memory = Memory(replay_memory_size, batch_size)
+        self.raw_action_tie_breaker = None
         
         # Checkpoint saving parameters
         self.save_path = save_path
         self.save_every = save_every
+
+    def set_raw_action_tie_breaker(self, tie_breaker):
+        ''' Set a PTCG raw action tie-breaker.
+
+        When enabled, step/eval_step still choose a template id internally but
+        return a concrete raw action id to the environment.
+        '''
+        self.raw_action_tie_breaker = tie_breaker
+        self.use_raw = tie_breaker is not None
 
     def feed(self, ts):
         ''' Store data in to replay buffer and train the agent. There are two stages.
@@ -133,7 +143,12 @@ class DQNAgent(object):
             ts (list): a list of 5 elements that represent the transition
         '''
         (state, action, reward, next_state, done) = tuple(ts)
-        self.feed_memory(state['obs'], action, reward, next_state['obs'], list(next_state['legal_actions'].keys()), done)
+        action = self._action_to_template(action, state)
+        # Ensure obs are flat numpy float32 arrays
+        s_obs = np.asarray(state['obs'], dtype=np.float32).ravel()
+        ns_obs = np.asarray(next_state['obs'], dtype=np.float32).ravel()
+        legal = list(next_state['legal_actions'].keys())
+        self.feed_memory(s_obs, action, reward, ns_obs, legal, done)
         self.total_t += 1
         tmp = self.total_t - self.replay_memory_init_size
         if tmp>=0 and tmp%self.train_every == 0:
@@ -157,7 +172,8 @@ class DQNAgent(object):
         probs[best_action_idx] += (1.0 - epsilon)
         action_idx = np.random.choice(np.arange(len(probs)), p=probs)
 
-        return legal_actions[action_idx]
+        action = legal_actions[action_idx]
+        return self._select_action_output(action, state)
 
     def eval_step(self, state):
         ''' Predict the action for evaluation purpose.
@@ -173,9 +189,14 @@ class DQNAgent(object):
         best_action = np.argmax(q_values)
 
         info = {}
-        info['values'] = {state['raw_legal_actions'][i]: float(q_values[list(state['legal_actions'].keys())[i]]) for i in range(len(state['legal_actions']))}
+        legal_keys = list(state['legal_actions'].keys())
+        info['values'] = {}
+        for i in range(len(legal_keys)):
+            raw_item = state['raw_legal_actions'][i]
+            key = raw_item if isinstance(raw_item, (str, int)) else raw_item.get('id', str(legal_keys[i]))
+            info['values'][key] = float(q_values[legal_keys[i]])
 
-        return best_action, info
+        return self._select_action_output(best_action, state), info
 
     def predict(self, state):
         ''' Predict the masked Q-values
@@ -186,13 +207,31 @@ class DQNAgent(object):
         Returns:
             q_values (numpy.array): a 1-d array where each entry represents a Q value
         '''
-        
-        q_values = self.q_estimator.predict_nograd(np.expand_dims(state['obs'], 0))[0]
+        obs = np.asarray(state['obs'], dtype=np.float32).ravel()
+        q_values = self.q_estimator.predict_nograd(np.expand_dims(obs, 0))[0]
         masked_q_values = -np.inf * np.ones(self.num_actions, dtype=float)
         legal_actions = list(state['legal_actions'].keys())
         masked_q_values[legal_actions] = q_values[legal_actions]
 
         return masked_q_values
+
+    def _select_action_output(self, template_id, state):
+        if self.raw_action_tie_breaker is None:
+            return template_id
+        return self.raw_action_tie_breaker.choose(int(template_id), state)
+
+    def _action_to_template(self, action, state):
+        if isinstance(action, (int, np.integer)):
+            return int(action)
+        if isinstance(action, str):
+            for raw_action in state.get('raw_legal_actions', []):
+                if isinstance(raw_action, dict) and raw_action.get('id') == action:
+                    return int(raw_action['template_id'])
+            try:
+                return int(action)
+            except ValueError:
+                pass
+        raise ValueError(f"Cannot map raw action to template id: {action}")
 
     def train(self):
         ''' Train the network
@@ -221,7 +260,8 @@ class DQNAgent(object):
         state_batch = np.array(state_batch)
 
         loss = self.q_estimator.update(state_batch, action_batch, target_batch)
-        print('\rINFO - Step {}, rl-loss: {}'.format(self.total_t, loss), end='')
+        if self.total_t % 100 == 0:
+            print('\rINFO - Step {}, rl-loss: {}'.format(self.total_t, loss), end='')
 
         # Update the target estimator
         if self.train_t % self.update_target_estimator_every == 0:
@@ -271,8 +311,8 @@ class DQNAgent(object):
             'replay_memory_init_size': self.replay_memory_init_size,
             'update_target_estimator_every': self.update_target_estimator_every,
             'discount_factor': self.discount_factor,
-            'epsilon_start': self.epsilons.min(),
-            'epsilon_end': self.epsilons.max(),
+            'epsilon_start': float(self.epsilons[0]),
+            'epsilon_end': float(self.epsilons[-1]),
             'epsilon_decay_steps': self.epsilon_decay_steps,
             'batch_size': self.batch_size,
             'num_actions': self.num_actions,
@@ -328,6 +368,16 @@ class DQNAgent(object):
             filename(str): the file name of checkpoint
         '''
         torch.save(self.checkpoint_attributes(), os.path.join(path, filename))
+
+    def load_checkpoint(self, path):
+        ''' Load the model checkpoint from a file
+
+        Args:
+            path (str): path to the checkpoint .pt file
+        '''
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        restored = self.__class__.from_checkpoint(checkpoint)
+        self.__dict__.update(restored.__dict__)
 
 
 class Estimator(object):
@@ -532,9 +582,17 @@ class Memory(object):
             next_state_batch (list): a batch of states
             done_batch (list): a batch of dones
         '''
-        samples = random.sample(self.memory, self.batch_size)
-        samples = tuple(zip(*samples))
-        return tuple(map(np.array, samples[:-1])) + (samples[-1],)
+        states, actions, rewards, next_states, dones, legal_actions = zip(
+            *random.sample(self.memory, self.batch_size)
+        )
+        return (
+            np.asarray(states, dtype=np.float32),
+            np.asarray(actions),
+            np.asarray(rewards, dtype=np.float32),
+            np.asarray(next_states, dtype=np.float32),
+            np.asarray(dones, dtype=bool),
+            list(legal_actions),
+        )
 
     def checkpoint_attributes(self):
         ''' Returns the attributes that need to be checkpointed

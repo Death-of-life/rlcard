@@ -65,6 +65,14 @@ class PtcgEnv(Env):
 
         super().__init__(config)
 
+        # Auto-detect state_shape from the actual observation
+        self.state_shape = self._detect_state_shape()
+
+    def _detect_state_shape(self):
+        """Compute the observation vector dimension from a sample state."""
+        state, _ = self.reset()
+        return [len(state["obs"])]
+
     # ---- RLCard Env abstract methods ----
 
     def _extract_state(self, state):
